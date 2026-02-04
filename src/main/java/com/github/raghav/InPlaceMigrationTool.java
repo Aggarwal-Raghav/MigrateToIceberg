@@ -31,15 +31,29 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Tool for performing in-place migration of Hive tables to Iceberg format.
- * This tool supports batch processing, dry runs, and automatic rollback on failure.
+ * InPlaceMigrationTool
+ * <p>
+ * A robust utility for migrating Apache Hive tables to Apache Iceberg using the "In-Place" strategy
+ * via the official {@code migrate} procedure.
+ * </p>
+ *
+ * <h3>Key Features:</h3>
+ * <ul>
+ * <li><b>Concurrency:</b> Processing is parallelized using a Fixed Thread Pool (JDK 17 compatible).</li>
+ * <li><b>Safety First:</b> Automatically converts MANAGED tables to EXTERNAL to prevent accidental data loss.</li>
+ * <li><b>Atomic Rollbacks:</b> If validation fails (row count mismatch), the tool automatically reverts changes.</li>
+ * <li><b>Optimized Discovery:</b> Uses single-pass metadata analysis to reduce Hive Metastore load.</li>
+ * <li><b>Smart Detection:</b> Skips tables that are already Iceberg or have unsupported formats.</li>
+ * </ul>
+ *
+ * <p><b>Compatibility:</b> JDK 17+, Spark 3.3+, Iceberg 1.4.3+</p>
  */
 public class InPlaceMigrationTool {
 
     private static final Logger logger = LoggerFactory.getLogger(InPlaceMigrationTool.class);
 
     /**
-     * Represents the status of a migration operation.
+     * Represents the final outcome of a migration attempt.
      */
     public enum MigrationStatus {
         SUCCESS,
@@ -48,22 +62,16 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Holds metadata information about a table.
-     *
-     * @param exists    Whether the table exists.
-     * @param isManaged Whether the table is a managed Hive table.
-     * @param isIceberg Whether the table is already in Iceberg format.
-     * @param format    The file format of the table (e.g., parquet, orc).
-     * @param location  The physical location of the table.
+     * Internal cache for table metadata to avoid multiple calls to the Metastore.
      */
     private record TableMetadata(
             boolean exists, boolean isManaged, boolean isIceberg, String format, String location) {}
 
     /**
-     * Entry point for the migration tool.
-     * Parses command line arguments and initiates the migration process.
+     * Main Entry Point.
+     * Parses command line arguments and initializes the Spark Session.
      *
-     * @param args Command line arguments.
+     * @param args Command line arguments (e.g., target DB, flags like --dry-run).
      */
     public static void main(String[] args) {
         String inputTarget = "default";
@@ -112,9 +120,10 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Executes the migration for a batch of tables using a thread pool.
+     * Orchestrates the batch migration process using a thread pool.
+     * Uses CompletableFuture to handle async execution and result collection.
      *
-     * @param spark  The SparkSession.
+     * @param spark  The active SparkSession.
      * @param config The migration configuration.
      */
     public void runBatch(SparkSession spark, MigrationConfig config) {
@@ -144,8 +153,10 @@ public class InPlaceMigrationTool {
                             executor))
                     .toList();
 
+            // Block until all tasks complete
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
+            // Collect results
             List<MigrationResult> results =
                     futures.stream().map(CompletableFuture::join).toList();
 
@@ -163,24 +174,37 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Migrates a single table to Iceberg format.
-     * Performs analysis, validation, and handles rollback if necessary.
+     * Core Logic: Migrates a single table.
+     * <p>
+     * Steps:
+     * 1. Check existence and format compatibility.
+     * 2. Check/Enforce EXTERNAL table status.
+     * 3. Perform Pre-Migration Count (Validation).
+     * 4. Execute `migrateTable` action.
+     * 5. Perform Post-Migration Count (Validation).
+     * 6. Cleanup backup table if configured.
+     * </p>
      *
      * @param spark     The SparkSession.
-     * @param tableName The name of the table to migrate.
-     * @param config    The migration configuration.
-     * @return The result of the migration.
+     * @param tableName The fully qualified table name.
+     * @param config    Runtime configuration.
+     * @return MigrationResult containing status and messages.
      */
     private MigrationResult migrateTable(SparkSession spark, String tableName, MigrationConfig config) {
         long start = System.currentTimeMillis();
 
-        String[] parts = tableName.split("\\.");
-        String db = parts.length > 1 ? parts[0] : "default";
-        String tbl = parts.length > 1 ? parts[1] : tableName;
+        // Fix: Extract simple table name to avoid "db.table_backup" pattern which causes AnalysisException.
+        // The migrate procedure works best with simple names when used in a specific catalog context,
+        // or we handle the string manually here to ensure it's a valid identifier.
+        String simpleTableName = tableName;
+        if (tableName.contains(".")) {
+            simpleTableName = tableName.substring(tableName.lastIndexOf(".") + 1);
+        }
 
-        String backupName = String.format("`%s`.`%s_hive_backup_%d`", db, tbl, System.currentTimeMillis());
+        String backupName = simpleTableName + "_hive_backup_" + System.currentTimeMillis();
 
         try {
+            // 1. Analyze Metadata (One-pass optimization)
             TableMetadata meta = analyzeTable(spark, tableName);
 
             if (!meta.exists()) {
@@ -196,6 +220,7 @@ public class InPlaceMigrationTool {
                         tableName, MigrationStatus.SKIPPED, 0, "Unsupported format (" + meta.format() + ")");
             }
 
+            // Check Managed Status
             if (meta.isManaged()) {
                 if (!config.convertManagedToExternal()) {
                     return new MigrationResult(
@@ -208,27 +233,29 @@ public class InPlaceMigrationTool {
                         tableName, MigrationStatus.SUCCESS, 0, "Dry Run: Ready (" + meta.format() + ")");
             }
 
+            // 2. Enforce External (Critical Safety Step)
             if (meta.isManaged()) {
                 convertManagedToExternal(spark, tableName);
             }
 
+            // 3. Pre-Migration Validation
             long preCount = -1;
             if (!config.skipValidation()) {
                 preCount = spark.table(tableName).count();
             }
 
-            // Execute Migrate
+            // 4. Execute Migrate Action
             logger.info("[{}] Executing Migrate Action...", tableName);
             SparkActions.get(spark)
                     .migrateTable(tableName)
-                    .backupTableName(backupName) // Passing the Quoted Identifier
+                    .backupTableName(backupName)
                     .tableProperties(Map.of(
                             "format-version", "2",
                             "migrated-at", Instant.now().toString(),
                             "migration-method", "in-place-migrate"))
                     .execute();
 
-            // Validation
+            // 5. Post-Migration Validation
             if (!config.skipValidation()) {
                 long postCount = spark.table(tableName).count();
                 if (preCount != postCount) {
@@ -243,6 +270,7 @@ public class InPlaceMigrationTool {
                 }
             }
 
+            // 6. Cleanup Backup (Optional)
             String cleanupMsg = "";
             if (config.dropBackup()) {
                 boolean dropped = safeDrop(spark, backupName);
@@ -259,18 +287,14 @@ public class InPlaceMigrationTool {
 
         } catch (Exception e) {
             logger.error("[{}] Migration Failed", tableName, e);
-            try {
-                if (!spark.catalog().tableExists(tableName)
-                        && spark.catalog().tableExists(backupName.replace("`", ""))) {
-                    performRollback(spark, tableName, backupName);
-                    return new MigrationResult(
-                            tableName,
-                            MigrationStatus.FAILURE,
-                            System.currentTimeMillis() - start,
-                            "Error: " + e.getMessage() + " (Rolled Back)");
-                }
-            } catch (Exception rollbackEx) {
-                logger.error("Failed during rollback check", rollbackEx);
+            // Attempt rollback if the original table is gone but backup exists
+            if (!spark.catalog().tableExists(tableName) && spark.catalog().tableExists(backupName)) {
+                performRollback(spark, tableName, backupName);
+                return new MigrationResult(
+                        tableName,
+                        MigrationStatus.FAILURE,
+                        System.currentTimeMillis() - start,
+                        "Error: " + e.getMessage() + " (Rolled Back)");
             }
             return new MigrationResult(
                     tableName, MigrationStatus.FAILURE, System.currentTimeMillis() - start, "Error: " + e.getMessage());
@@ -278,11 +302,12 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Analyzes a table to gather metadata such as format, type, and location.
+     * Analyzes table metadata in a single pass using `DESCRIBE EXTENDED`.
+     * This reduces Metastore load by fetching format, type, and provider in one call.
      *
      * @param spark     The SparkSession.
-     * @param tableName The name of the table to analyze.
-     * @return The metadata of the table.
+     * @param tableName The table to analyze.
+     * @return A TableMetadata record containing cached properties.
      */
     private TableMetadata analyzeTable(SparkSession spark, String tableName) {
         try {
@@ -302,22 +327,27 @@ public class InPlaceMigrationTool {
                 String key = r.getString(0) != null ? r.getString(0).trim() : "";
                 String val = r.getString(1);
 
-                if (key.equals("InputFormat")) {
-                    String lower = val.toLowerCase();
-                    if (lower.contains("iceberg")) isIceberg = true;
-                    else if (lower.contains("parquet")) format = "parquet";
-                    else if (lower.contains("orc")) format = "orc";
-                    else if (lower.contains("avro")) format = "avro";
-                    else format = val;
-                } else if (key.equals("Provider")) {
-                    if (val.equalsIgnoreCase("iceberg")) isIceberg = true;
-                } else if (key.equals("Type")) {
-                    if (val.toUpperCase().contains("MANAGED")) isManaged = true;
-                } else if (key.equals("Location")) {
-                    location = val;
-                } else if (key.equals("Table Properties")) {
-                    if (val != null && val.toUpperCase().contains("TABLE_TYPE=ICEBERG")) {
-                        isIceberg = true;
+                // Using Enhanced Switch (Switch Expressions) for cleaner logic
+                switch (key) {
+                    case "InputFormat" -> {
+                        String lower = val.toLowerCase();
+                        if (lower.contains("iceberg")) isIceberg = true;
+                        else if (lower.contains("parquet")) format = "parquet";
+                        else if (lower.contains("orc")) format = "orc";
+                        else if (lower.contains("avro")) format = "avro";
+                        else format = val;
+                    }
+                    case "Provider" -> {
+                        if (val.equalsIgnoreCase("iceberg")) isIceberg = true;
+                    }
+                    case "Type" -> {
+                        if (val.toUpperCase().contains("MANAGED")) isManaged = true;
+                    }
+                    case "Location" -> location = val;
+                    case "Table Properties" -> {
+                        if (val != null && val.toUpperCase().contains("TABLE_TYPE=ICEBERG")) {
+                            isIceberg = true;
+                        }
                     }
                 }
             }
@@ -331,18 +361,14 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Rolls back a migration by restoring the original table from the backup.
-     *
-     * @param spark        The SparkSession.
-     * @param originalName The original name of the table.
-     * @param backupName   The name of the backup table.
+     * Rolls back a failed migration by renaming the backup table back to the original name.
+     * WARNING: Drops the current (potentially broken) table before renaming.
      */
     private void performRollback(SparkSession spark, String originalName, String backupName) {
         try {
             logger.warn("[{}] Attempting rollback...", originalName);
             spark.sql("DROP TABLE IF EXISTS " + originalName);
-            // Check if backup exists (handling quotes potentially)
-            if (spark.catalog().tableExists(backupName.replace("`", ""))) {
+            if (spark.catalog().tableExists(backupName)) {
                 spark.sql(String.format("ALTER TABLE %s RENAME TO %s", backupName, originalName));
                 logger.info("[{}] Rollback successful.", originalName);
             }
@@ -360,10 +386,7 @@ public class InPlaceMigrationTool {
      */
     private boolean safeDrop(SparkSession spark, String tableName) {
         try {
-            // Remove quotes for catalog check if necessary, but DROP usually handles them
-            String cleanName = tableName.replace("`", "");
-            if (!spark.catalog().tableExists(cleanName)) return true;
-
+            if (!spark.catalog().tableExists(tableName)) return true;
             spark.sql(String.format("ALTER TABLE %s SET TBLPROPERTIES('EXTERNAL'='TRUE')", tableName));
             spark.sql("DROP TABLE " + tableName);
             return true;
@@ -399,11 +422,11 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Discovers tables based on the input target (database or comma-separated list).
+     * Discovers tables based on input string (List, Single Table, or Database Scan).
      *
-     * @param spark The SparkSession.
-     * @param input The input target string.
-     * @return A list of table names.
+     * @param spark SparkSession
+     * @param input Input string (comma-separated list, single table, or DB name)
+     * @return List of fully qualified table names.
      */
     public List<String> discoverTables(SparkSession spark, String input) {
         if (input.contains(",")) {
@@ -418,7 +441,7 @@ public class InPlaceMigrationTool {
         try {
             return spark.catalog().listTables(input).collectAsList().stream()
                     .filter(t -> !t.tableType().equalsIgnoreCase("VIEW"))
-                    .map(t -> input + "." + t.name())
+                    .map(t -> input + "." + t.name()) // We return fully qualified names here
                     .toList();
         } catch (Exception e) {
             logger.error("Error scanning DB", e);
@@ -427,20 +450,30 @@ public class InPlaceMigrationTool {
     }
 
     /**
-     * Prints a summary report of the migration results.
+     * Prints a formatted summary report of all migration tasks to the standard output.
+     * <p>
+     * This method iterates through the list of migration results and displays a tabular view
+     * containing the Table Name, Migration Status, and any relevant messages (errors or success details).
+     * It also calculates and prints aggregate statistics (Total, Success, Failed, Skipped).
+     * </p>
      *
-     * @param results The list of migration results.
+     * @param results The list of {@link MigrationResult} objects collected from the batch execution.
      */
     private void printReport(List<MigrationResult> results) {
-        System.out.println("\n" + "=".repeat(95));
+        System.out.println("\n" + "=".repeat(100));
         System.out.println(" MIGRATION REPORT");
-        System.out.println("=".repeat(95));
-        System.out.printf("%-30s | %-10s | %s%n", "Table", "Status", "Message");
-        System.out.println("-".repeat(95));
+        System.out.println("=".repeat(100));
 
+        // Header format matches row format for alignment
+        System.out.printf("%-30s | %-10s | %s%n", "Table", "Status", "Message");
+        System.out.println("-".repeat(100));
+
+        // Print individual rows
         results.forEach(res -> System.out.printf("%-30s | %-10s | %s%n", res.tableName(), res.status(), res.message()));
 
-        System.out.println("=".repeat(95));
+        System.out.println("=".repeat(100));
+
+        // Calculate aggregate statistics using stream filtering
         long success = results.stream()
                 .filter(r -> r.status() == MigrationStatus.SUCCESS)
                 .count();
@@ -450,6 +483,7 @@ public class InPlaceMigrationTool {
         long skipped = results.stream()
                 .filter(r -> r.status() == MigrationStatus.SKIPPED)
                 .count();
+
         System.out.printf(
                 "Total: %d | Success: %d | Failed: %d | Skipped: %d%n", results.size(), success, failed, skipped);
     }

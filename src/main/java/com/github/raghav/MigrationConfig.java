@@ -18,14 +18,14 @@ package com.github.raghav;
 import java.util.List;
 
 /**
- * Configuration for the migration process.
+ * Immutable configuration record holding all runtime settings.
  *
- * @param tableList                List of tables to migrate.
- * @param dropBackup               Whether to drop the backup table after successful migration.
- * @param dryRun                   Whether to perform a dry run without making changes.
- * @param convertManagedToExternal Whether to convert managed tables to external tables before migration.
- * @param skipValidation           Whether to skip data validation after migration.
- * @param threadPoolSize           Number of threads to use for batch processing.
+ * @param tableList                List of fully qualified table names to process.
+ * @param dropBackup               If true, drops the Hive backup table after a successful migration.
+ * @param dryRun                   If true, simulates the migration checks without making changes.
+ * @param convertManagedToExternal If true, automatically converts MANAGED tables to EXTERNAL.
+ * @param skipValidation           If true, skips the expensive pre/post row count validation.
+ * @param threadPoolSize           Number of concurrent migration threads.
  */
 public record MigrationConfig(
         List<String> tableList,
