@@ -43,14 +43,14 @@ import org.slf4j.LoggerFactory;
  * <li><b>Safety First:</b> Automatically converts MANAGED tables to EXTERNAL to prevent accidental data loss.</li>
  * <li><b>Atomic Rollbacks:</b> If validation fails (row count mismatch), the tool automatically reverts changes.</li>
  * <li><b>Optimized Discovery:</b> Uses single-pass metadata analysis to reduce Hive Metastore load.</li>
- * <li><b>Smart Detection:</b> Skips tables that are already Iceberg or have unsupported formats.</li>
+ * <li><b>Smart Detection:</b> Skips tables that are already Iceberg, have unsupported formats, or are backup tables.</li>
  * </ul>
  *
  * <p><b>Compatibility:</b> JDK 17+, Spark 3.3+, Iceberg 1.4.3+</p>
  */
 public class InPlaceMigrationTool {
 
-    private static final Logger logger = LoggerFactory.getLogger(InPlaceMigrationTool.class);
+    private static final Logger LOG = LoggerFactory.getLogger(InPlaceMigrationTool.class);
 
     /**
      * Represents the final outcome of a migration attempt.
@@ -104,13 +104,13 @@ public class InPlaceMigrationTool {
                 .enableHiveSupport()
                 .getOrCreate()) {
 
-            logger.info("Starting In-Place Migration for: {}", inputTarget);
+            LOG.info("Starting In-Place Migration for: {}", inputTarget);
 
             var tool = new InPlaceMigrationTool();
             List<String> tables = tool.discoverTables(spark, inputTarget);
 
             if (tables.isEmpty()) {
-                logger.warn("No eligible tables found.");
+                LOG.warn("No eligible tables found.");
                 return;
             }
 
@@ -127,7 +127,7 @@ public class InPlaceMigrationTool {
      * @param config The migration configuration.
      */
     public void runBatch(SparkSession spark, MigrationConfig config) {
-        logger.info(
+        LOG.info(
                 "Batch: {}. Threads: {}. DryRun: {}. SkipValidation: {}",
                 config.tableList().size(),
                 config.threadPoolSize(),
@@ -193,17 +193,23 @@ public class InPlaceMigrationTool {
     private MigrationResult migrateTable(SparkSession spark, String tableName, MigrationConfig config) {
         long start = System.currentTimeMillis();
 
-        // Fix: Extract simple table name to avoid "db.table_backup" pattern which causes AnalysisException.
-        // The migrate procedure works best with simple names when used in a specific catalog context,
-        // or we handle the string manually here to ensure it's a valid identifier.
+        // Fix: Extract simple table name to avoid naming issues and construct deterministic backup name
         String simpleTableName = tableName;
+        String dbPrefix = "";
         if (tableName.contains(".")) {
-            simpleTableName = tableName.substring(tableName.lastIndexOf(".") + 1);
+            int lastDotIndex = tableName.lastIndexOf(".");
+            simpleTableName = tableName.substring(lastDotIndex + 1);
+            dbPrefix = tableName.substring(0, lastDotIndex + 1); // includes dot
         }
 
-        String backupName = simpleTableName + "_hive_backup_" + System.currentTimeMillis();
+        // Deterministic backup name (no timestamp) to prevent accumulation of backups on re-runs
+        String backupName = simpleTableName + "_hive_backup_";
+        // Fully qualified backup name for catalog checks
+        String fullBackupName = dbPrefix + backupName;
 
         try {
+            LOG.info("[{}] Starting migration analysis...", tableName);
+
             // 1. Analyze Metadata (One-pass optimization)
             TableMetadata meta = analyzeTable(spark, tableName);
 
@@ -218,6 +224,16 @@ public class InPlaceMigrationTool {
             if (!isMigratable(meta.format())) {
                 return new MigrationResult(
                         tableName, MigrationStatus.SKIPPED, 0, "Unsupported format (" + meta.format() + ")");
+            }
+
+            // Check if a backup table already exists from a previous run
+            if (spark.catalog().tableExists(fullBackupName)) {
+                LOG.warn("[{}] Existing backup table found: {}. Attempting to clear it.", tableName, fullBackupName);
+                if (!safeDrop(spark, fullBackupName)) {
+                    return new MigrationResult(
+                            tableName, MigrationStatus.FAILURE, 0, "Failed to drop existing backup: " + fullBackupName);
+                }
+                LOG.info("[{}] Cleared existing backup table.", tableName);
             }
 
             // Check Managed Status
@@ -241,11 +257,12 @@ public class InPlaceMigrationTool {
             // 3. Pre-Migration Validation
             long preCount = -1;
             if (!config.skipValidation()) {
+                LOG.info("[{}] Performing pre-migration count check...", tableName);
                 preCount = spark.table(tableName).count();
             }
 
             // 4. Execute Migrate Action
-            logger.info("[{}] Executing Migrate Action...", tableName);
+            LOG.info("[{}] Executing Migrate Action. Backup: {}", tableName, backupName);
             SparkActions.get(spark)
                     .migrateTable(tableName)
                     .backupTableName(backupName)
@@ -257,11 +274,12 @@ public class InPlaceMigrationTool {
 
             // 5. Post-Migration Validation
             if (!config.skipValidation()) {
+                LOG.info("[{}] Performing post-migration count check...", tableName);
                 long postCount = spark.table(tableName).count();
                 if (preCount != postCount) {
-                    logger.error(
+                    LOG.error(
                             "[{}] Count Mismatch (Pre: {}, Post: {}). Rolling back...", tableName, preCount, postCount);
-                    performRollback(spark, tableName, backupName);
+                    performRollback(spark, tableName, backupName); // Note: rollback uses simple name logic usually
                     return new MigrationResult(
                             tableName,
                             MigrationStatus.FAILURE,
@@ -273,12 +291,13 @@ public class InPlaceMigrationTool {
             // 6. Cleanup Backup (Optional)
             String cleanupMsg = "";
             if (config.dropBackup()) {
-                boolean dropped = safeDrop(spark, backupName);
+                boolean dropped = safeDrop(spark, fullBackupName);
                 cleanupMsg = dropped ? " (Backup Dropped)" : " (Backup Drop Failed)";
             } else {
                 cleanupMsg = " (Backup: " + backupName + ")";
             }
 
+            LOG.info("[{}] Migration successful. Format: {}", tableName, meta.format());
             return new MigrationResult(
                     tableName,
                     MigrationStatus.SUCCESS,
@@ -286,10 +305,10 @@ public class InPlaceMigrationTool {
                     "Success. Format: " + meta.format() + cleanupMsg);
 
         } catch (Exception e) {
-            logger.error("[{}] Migration Failed", tableName, e);
+            LOG.error("[{}] Migration Failed", tableName, e);
             // Attempt rollback if the original table is gone but backup exists
-            if (!spark.catalog().tableExists(tableName) && spark.catalog().tableExists(backupName)) {
-                performRollback(spark, tableName, backupName);
+            if (!spark.catalog().tableExists(tableName) && spark.catalog().tableExists(fullBackupName)) {
+                performRollback(spark, tableName, backupName); // Uses simple backup name if passed to SQL inside
                 return new MigrationResult(
                         tableName,
                         MigrationStatus.FAILURE,
@@ -355,7 +374,7 @@ public class InPlaceMigrationTool {
             return new TableMetadata(true, isManaged, isIceberg, format, location);
 
         } catch (Exception e) {
-            logger.warn("Failed to analyze table {}", tableName, e);
+            LOG.warn("Failed to analyze table {}", tableName, e);
             return new TableMetadata(false, false, false, "error", "");
         }
     }
@@ -366,14 +385,23 @@ public class InPlaceMigrationTool {
      */
     private void performRollback(SparkSession spark, String originalName, String backupName) {
         try {
-            logger.warn("[{}] Attempting rollback...", originalName);
+            // Need fully qualified name for backup if original is qualified
+            String qualifiedBackup = backupName;
+            if (originalName.contains(".") && !backupName.contains(".")) {
+                String db = originalName.substring(0, originalName.lastIndexOf("."));
+                qualifiedBackup = db + "." + backupName;
+            }
+
+            LOG.warn("[{}] Attempting rollback using backup {}...", originalName, qualifiedBackup);
             spark.sql("DROP TABLE IF EXISTS " + originalName);
-            if (spark.catalog().tableExists(backupName)) {
-                spark.sql(String.format("ALTER TABLE %s RENAME TO %s", backupName, originalName));
-                logger.info("[{}] Rollback successful.", originalName);
+            if (spark.catalog().tableExists(qualifiedBackup)) {
+                spark.sql(String.format("ALTER TABLE %s RENAME TO %s", qualifiedBackup, originalName));
+                LOG.info("[{}] Rollback successful.", originalName);
+            } else {
+                LOG.error("[{}] Backup table {} not found. Cannot rollback.", originalName, qualifiedBackup);
             }
         } catch (Exception e) {
-            logger.error("[{}] Rollback failed.", originalName, e);
+            LOG.error("[{}] Rollback failed.", originalName, e);
         }
     }
 
@@ -391,7 +419,7 @@ public class InPlaceMigrationTool {
             spark.sql("DROP TABLE " + tableName);
             return true;
         } catch (Exception e) {
-            logger.warn("Failed to drop backup " + tableName, e);
+            LOG.warn("Failed to drop backup " + tableName, e);
             return false;
         }
     }
@@ -405,9 +433,9 @@ public class InPlaceMigrationTool {
     private void convertManagedToExternal(SparkSession spark, String tableName) {
         try {
             spark.sql(String.format("ALTER TABLE %s SET TBLPROPERTIES('EXTERNAL'='TRUE')", tableName));
-            logger.info("[{}] Converted to EXTERNAL.", tableName);
+            LOG.info("[{}] Converted to EXTERNAL.", tableName);
         } catch (Exception e) {
-            logger.warn("[{}] Failed to set External status.", tableName, e);
+            LOG.warn("[{}] Failed to set External status.", tableName, e);
         }
     }
 
@@ -441,10 +469,12 @@ public class InPlaceMigrationTool {
         try {
             return spark.catalog().listTables(input).collectAsList().stream()
                     .filter(t -> !t.tableType().equalsIgnoreCase("VIEW"))
+                    // Ignore backup tables to avoid infinite migration loops or accidental damage
+                    .filter(t -> !t.name().endsWith("_hive_backup_"))
                     .map(t -> input + "." + t.name()) // We return fully qualified names here
                     .toList();
         } catch (Exception e) {
-            logger.error("Error scanning DB", e);
+            LOG.error("Error scanning DB", e);
             return List.of();
         }
     }
